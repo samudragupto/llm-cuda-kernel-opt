@@ -21,3 +21,11 @@ __pycache__/
 .vscode/
 .idea/
 .vs/
+
+# Model checkpoints & cache
+models/
+*.safetensors
+*.bin
+build/
+*.pyd
+*.so

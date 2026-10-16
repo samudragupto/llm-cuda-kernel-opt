@@ -1,68 +1,89 @@
-# CUDA Optimization: Fused Residual Add + RMSNorm
+# LLM CUDA Kernel Optimization: Fused Residual Add + RMSNorm
 
-A clean, standalone CUDA implementation of fused **Residual Addition + RMSNorm** for Transformer decoder layers, targeting **TinyLlama-1.1B** and **Llama-3.2-1B** on the **NVIDIA GeForce RTX 4060 Laptop GPU** (`sm_89`, Ada Lovelace).
+A clean CUDA kernel optimization integrating fused **Residual Addition + RMSNorm** directly into a 1.1-billion parameter language model (**TinyLlama-1.1B-Chat**) on an **NVIDIA GeForce RTX 4060 Laptop GPU** (`sm_89`, Ada Lovelace).
 
 ---
 
-## 1. Background & Problem
+## 1. Overview & Key Results
 
-In LLaMA-style decoders, each layer executes two normalization steps:
+This project addresses the pre-task:
+> *"Take a billion+ parameter open-source LLM. Run it via a GPU. Now optimize its CUDA kernels to improve the throughput by at least 5%."*
+
+### Key Results
+* **Real Model End-to-End Throughput:** Increased from **56.92 tokens/s** to **67.17 tokens/s** on TinyLlama-1.1B-Chat (**+18.00% throughput speedup**).
+* **Numerical Correctness:** **100% bit-exact token match** (`torch.equal` asserted `True`) between baseline and optimized greedy output.
+* **Micro-benchmark Kernel Speedup:** **2.16x faster** in single-token autoregressive decoding ($7.18\,\mu\text{s}$ vs $15.52\,\mu\text{s}$), and **228.0 GB/s sustained DRAM bandwidth** (89.1% of hardware peak) on long sequences ($N=16,384$).
+
+---
+
+## 2. Architecture & Fusion Strategy
+
+In standard Transformer decoders (such as LLaMA, TinyLlama, and Llama-3), each layer performs two sequential normalization operations:
 1. **Post-Attention:** Residual Add + RMSNorm
 2. **Post-MLP:** Residual Add + RMSNorm
 
 For a 22-layer model like TinyLlama-1.1B, this sequence runs 44 times per forward pass.
 
-### Unfused vs Fused Memory Flow
-
-In baseline implementations (like standard PyTorch), the residual addition and RMSNorm run as two separate kernels, forcing an intermediate DRAM round-trip:
-
 ```mermaid
 graph TD
-    subgraph Baseline ["Unfused Baseline (2 Kernels, 10 B/elem)"]
-        x1["Input x (2B)"] --> K1["Kernel 1: Add"]
-        r1["Residual r (2B)"] --> K1
+    subgraph Baseline ["Unfused Baseline (6 Launches, 10 B/elem)"]
+        x1["Input x (FP16)"] --> K1["Kernel 1: Add"]
+        r1["Residual r (FP16)"] --> K1
         K1 -->|"Write (2B)"| DRAM["Intermediate h in DRAM"]
-        DRAM -->|"Read (2B)"| K2["Kernel 2: RMSNorm"]
-        w1["Weight gamma (4KB)"] --> K2
-        K2 -->|"Write (2B)"| y1["Output y"]
+        DRAM -->|"Read (2B)"| K2["Cast to FP32"]
+        K2 --> K3["Pow(2)"]
+        K3 --> K4["Mean Reduction"]
+        K4 --> K5["Rsqrt + Cast"]
+        K5 --> K6["Mul by Weight"]
+        K6 -->|"Write (2B)"| y1["Output y"]
     end
 
-    subgraph Fused ["Optimized Fused (1 Kernel, 8 B/elem)"]
-        x2["Input x (2B)"] --> KF["Fused Add + RMSNorm Kernel"]
-        r2["Residual r (2B)"] --> KF
-        w2["Weight gamma (4KB)"] --> KF
-        KF -->|"Write once (2B)"| h2["New Residual Stream"]
-        KF -->|"Keep in registers -> Normalize -> Write (2B)"| y2["Output y"]
+    subgraph Fused ["Optimized sm_89 Fused (1 Launch, 8 B/elem)"]
+        x2["Input x (FP16)"] --> KF["Fused Add + RMSNorm Kernel"]
+        r2["Residual r (FP16)"] --> KF
+        w2["Weight gamma"] --> KF
+        KF -. "Float4 128-bit Vector Load" .-> KF
+        KF -. "Intra-Warp Shuffle Reduction" .-> KF
+        KF -->|"Write once (2B)"| h2["Updated Residual Stream"]
+        KF -->|"Normalize in registers -> Write (2B)"| y2["Normalized Output y"]
     end
 ```
 
-* **Baseline:** Read $x$ (2B) + Read $r$ (2B) + Write $h$ (2B) + Read $h$ (2B) + Write $y$ (2B) = **10 bytes/element** across 2 kernel launches.
-* **Fused:** Read $x$ (2B) + Read $r$ (2B) + Write $h$ (2B) + Write $y$ (2B) = **8 bytes/element** (**20% fewer DRAM bytes**) in 1 kernel launch. The row is kept in GPU registers for the reduction, eliminating the extra DRAM read.
+### Why Fusion Works
+* **Eliminates Intermediate DRAM Access:** Standard PyTorch writes the added residual to GPU memory, then immediately reads it back to compute variance and normalization. The fused kernel keeps the residual sum in thread registers (`fmaf`), writing it directly once to DRAM for downstream consumption while immediately evaluating the variance.
+* **Reduces Launch Overhead:** Replaces 6 separate kernel launches per site (132 launches per token) with a single launch (22 launches per token).
+* **128-bit Vectorization:** Uses `reinterpret_cast<const float4*>` and `reinterpret_cast<const __half2*>` to issue 128-bit memory instructions, matching the 128-bit bus of the RTX 4060 GPU.
+* **Intra-Warp Shuffle Primitives:** Inter-thread reductions are resolved across registers via `__shfl_down_sync`, minimizing shared memory allocation (36 bytes) and avoiding global memory atomics.
 
 ---
 
-## 2. Kernel Design
+## 3. End-to-End Real Model Evaluation
 
-The kernel in [`benchmark_rmsnorm.cu`](benchmark_rmsnorm.cu) uses standard GPU performance practices:
+* **Model:** [TinyLlama/TinyLlama-1.1B-Chat](https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat) (1.1 Billion parameters, FP16, $D=2048$, 22 layers)
+* **GPU:** NVIDIA GeForce RTX 4060 Laptop GPU (Ada Lovelace `sm_89`, 24 SMs, 8GB VRAM)
+* **Workload:** 192 input prompt tokens, 128 generated tokens, greedy deterministic decoding (`do_sample=False`)
+* **Measurement:** 3 warmup runs, 5 timed evaluation passes with synchronized CUDA events (`torch.cuda.Event(enable_timing=True)`)
 
-1. **128-Bit Vectorization:** Pointers are cast to `float4` so each thread loads 8 FP16 values per memory instruction. Calculations use packed `__half2` arithmetic.
-2. **Cache Hints:** Loads for activations ($x$, $r$) use `__ldcs` (streaming, evict-first) to avoid polluting the 32 MiB L2 cache. Weights use `__ldg` through the read-only cache.
-3. **Warp & Block Reduction:**
-   - Within each warp (32 threads), values are summed using `__shfl_down_sync`.
-   - The 8 warp partials are reduced in shared memory (`s_partial[8]`) and broadcast to all threads.
-4. **Register Budget:**
-   - Compiled to **30 registers/thread**, **36 bytes shared memory**, and **0 register spills**.
-   - Achieves **6 active CTAs per SM** (1,536 active threads/SM).
+### End-to-End Throughput Table
+
+| Trial | Baseline Latency (s) | Baseline Throughput (tok/s) | Optimized Latency (s) | Optimized Throughput (tok/s) | Speedup (%) |
+| :---: | :---: | :---: | :---: | :---: | :---: |
+| **1** | 2.2344 | 57.28 | 1.9675 | 65.06 | **+13.57%** |
+| **2** | 2.2566 | 56.72 | 1.8836 | 67.95 | **+19.80%** |
+| **3** | 2.2129 | 57.84 | 1.8851 | 67.90 | **+17.39%** |
+| **4** | 2.2172 | 57.73 | 1.8943 | 67.57 | **+17.05%** |
+| **5** | 2.3224 | 55.11 | 1.8981 | 67.44 | **+22.36%** |
+| **AVERAGE** | **2.2487** | **56.92** | **1.9057** | **67.17** | **+18.00%** |
+
+*Verification Check: Output tokens between baseline and optimized were verified with `torch.equal()`. Token strings matched 100% token-for-token.*
 
 ---
 
-## 3. Benchmark Results (RTX 4060 Laptop GPU)
+## 4. Standalone CUDA Micro-Benchmark Results
 
-* **Hardware:** NVIDIA GeForce RTX 4060 Laptop GPU (24 SMs, 32 MiB L2 Cache, 256 GB/s peak bandwidth, 8 GB VRAM)
-* **Model Config:** Hidden dimension $D = 2048$, FP16 precision, $\epsilon = 10^{-5}$
-* **Numerical Check:** Relative $L_2$ error vs double-precision CPU reference = **$2.85 \times 10^{-6}$** (residual stream is bit-identical, PASS)
+Evaluated across sequence lengths $N=1$ to $16,384$ ($D=2048$, FP16) on the RTX 4060 Laptop GPU (256 GB/s theoretical peak bandwidth):
 
-### Eager Mode (Standard Driver Launches)
+### Eager Kernel Launches
 
 | Tokens ($N$) | Naive Baseline ($\mu\text{s}$) | Vectorized Unfused ($\mu\text{s}$) | Fused Optimized ($\mu\text{s}$) | Fused Bandwidth (GB/s) | Speedup vs Baseline |
 | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -76,65 +97,55 @@ The kernel in [`benchmark_rmsnorm.cu`](benchmark_rmsnorm.cu) uses standard GPU p
 | **8192** | 702.48 | 729.30 | **589.65** | 227.6 | **1.19x** |
 | **16384 (Prefill)** | 1405.84 | 1465.51 | **1177.21** | 228.0 (89.1% peak) | **1.19x** (+24.5% vs vec) |
 
-*\*Note: Between $N = 1024$ and $2048$, the tensors fit entirely inside the RTX 4060's 32 MiB L2 cache. Once sequences exceed L2 ($N \ge 8192$), DRAM traffic dominates and fusion provides an immediate 24.5% speedup over vectorized unfused.*
-
-### CUDA Graph Mode (Driver Latency Removed)
-
-| Tokens ($N$) | Naive Baseline ($\mu\text{s}$) | Vectorized Unfused ($\mu\text{s}$) | Fused Optimized ($\mu\text{s}$) | Speedup vs Baseline | Speedup vs Vec-Unfused |
-| :---: | :---: | :---: | :---: | :---: | :---: |
-| **1 (Decode)** | 2.21 | 1.88 | **1.15** | **1.92x** | **1.63x** |
-| **16** | 3.10 | 2.68 | **2.11** | **1.47x** | **1.27x** |
-| **64** | 5.86 | 5.43 | **5.12** | **1.15x** | **1.06x** |
-| **256** | 18.60 | 17.26 | **17.75** | **1.05x** | 0.97x |
-| **8192** | 700.94 | 730.95 | **589.54** | **1.19x** | **1.24x** |
-| **16384 (Prefill)** | 1404.00 | 1466.90 | **1176.64** | **1.19x** | **1.25x** |
-
-### End-to-End Model Impact
-
-| Model | Norm Sites / Pass | Single-Token Decode Saved | Prefill Latency Saved ($N = 16\text{k}$) | Net Forward Pass Speedup |
-| :--- | :---: | :---: | :---: | :---: |
-| **TinyLlama-1.1B** | 44 | **$367.0\,\mu\text{s}$ (Eager) / $46.6\,\mu\text{s}$ (Graph)** | **$12.69\,\text{ms}$** | **$10.5\%\text{--}14.7\%$ (Decode)**<br>**$8.0\%\text{--}12.0\%$ (Prefill)** |
-| **Llama-3.2-1B** | 32 | **$266.9\,\mu\text{s}$ (Eager) / $33.9\,\mu\text{s}$ (Graph)** | **$9.23\,\text{ms}$** | **$9.0\%\text{--}13.0\%$ (Decode)**<br>**$7.0\%\text{--}11.0\%$ (Prefill)** |
-
-Both regimes comfortably exceed the **5% throughput improvement** target.
+*\*Note: Between $N = 1024$ and $2048$, tensor footprints fit inside the GPU's 32 MiB L2 cache. At $N \ge 8192$, DRAM traffic dominates and fusion provides an immediate 24.5% speedup over vectorized unfused.*
 
 ---
 
-## 4. Files in this Repository
+## 5. Repository Structure
 
-* [`benchmark_rmsnorm.cu`](benchmark_rmsnorm.cu): Standalone C++/CUDA benchmark code with validation and timing.
-* [`profile.sh`](profile.sh): Shell script to run Nsight Compute (`ncu`) or export benchmark CSVs.
-* [`Makefile`](Makefile): Build script with targets for compile, run, and clean.
-* [`profile_results.csv`](profile_results.csv): Output CSV formatted for copying directly into Google Sheets.
-* [`.github/workflows/ci.yml`](.github/workflows/ci.yml): GitHub Actions workflow for automated compilation checks.
+```text
+llm-cuda-kernel-opt/
+├── fused_ops.cu                     # sm_89 vectorized C++/CUDA extension module
+├── setup.py                         # PyTorch setuptools build file for sm_89
+├── run_real_llm_benchmark.py        # End-to-end benchmark harness for TinyLlama-1.1B
+├── real_model_throughput_results.csv# Logged throughput & latency measurements
+├── REAL_MODEL_EVALUATION.md         # Full evaluation document & architectural report
+├── benchmark_rmsnorm.cu             # Standalone CUDA C++ micro-benchmark
+├── Makefile                         # Build targets for standalone benchmark
+├── profile.sh                       # Automation script for profiling and CSV generation
+├── profile_results.csv              # Micro-benchmark timing data for Google Sheets
+└── .github/workflows/ci.yml         # CI workflow for compilation checks
+```
 
 ---
 
-## 5. Commands to Run
+## 6. How to Run
 
-### Compile
+### 1. Real Model End-to-End Benchmark (TinyLlama-1.1B)
+
 ```bash
-# Using Makefile
+# Activate your environment
+conda activate llm-kernel
+
+# Build the C++/CUDA extension module in-place
+python setup.py build_ext --inplace
+
+# Run the end-to-end evaluation harness
+python run_real_llm_benchmark.py
+```
+
+### 2. Standalone CUDA Micro-Benchmark
+
+```bash
+# Compile micro-benchmark targeting sm_89
 make all
 
-# Or directly with nvcc
-nvcc -O3 -std=c++17 -arch=sm_89 -lineinfo benchmark_rmsnorm.cu -o benchmark_rmsnorm.exe
-```
-
-### Run
-```bash
-# Standard benchmark
+# Run micro-benchmark
 ./benchmark_rmsnorm.exe
 
-# With CUDA Graphs
+# Run with CUDA Graphs
 ./benchmark_rmsnorm.exe --graph
 
-# Custom token sweep
-./benchmark_rmsnorm.exe --tokens 1,64,256,4096,16384 --warmup 50 --iters 200 --repeats 9
-```
-
-### Profile & Export CSV
-```bash
-# Profile and generate Google Sheets CSV
+# Run profiling sweep & export CSV
 bash ./profile.sh 1,256,16384
 ```

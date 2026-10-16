@@ -3,7 +3,7 @@
 ## Executive Summary
 This document reports the end-to-end evaluation of the sm_89 fused Residual-Add + RMSNorm CUDA kernel integrated directly into **TinyLlama-1.1B-Chat** running on an **NVIDIA GeForce RTX 4060 Laptop GPU** (Ada Lovelace, sm_89).
 
-By fusing the attention residual accumulation and post-attention RMSNorm across all 22 decoder layers into a single vectorized 128-bit CUDA kernel, end-to-end autoregressive token generation throughput improved from **56.92 tokens/s** to **67.17 tokens/s**, delivering a **+18.00% throughput speedup** with **100% exact numerical bit-equivalence**.
+By fusing the attention residual accumulation and post-attention RMSNorm across all 22 decoder layers into a single vectorized 128-bit CUDA kernel, end-to-end autoregressive token generation throughput improved from **59.31 tokens/s** to **68.91 tokens/s**, delivering a **+16.18% throughput speedup** with **100% exact numerical bit-equivalence**.
 
 ```mermaid
 graph TD
@@ -71,12 +71,12 @@ graph TD
 
 | Trial | Baseline Latency (s) | Baseline Throughput (tok/s) | Optimized Latency (s) | Optimized Throughput (tok/s) | Speedup (%) |
 | :---: | :---: | :---: | :---: | :---: | :---: |
-| **1** | 2.2344 | 57.28 | 1.9675 | 65.06 | **+13.57%** |
-| **2** | 2.2566 | 56.72 | 1.8836 | 67.95 | **+19.80%** |
-| **3** | 2.2129 | 57.84 | 1.8851 | 67.90 | **+17.39%** |
-| **4** | 2.2172 | 57.73 | 1.8943 | 67.57 | **+17.05%** |
-| **5** | 2.3224 | 55.11 | 1.8981 | 67.44 | **+22.36%** |
-| **AVERAGE** | **2.2487** | **56.92** | **1.9057** | **67.17** | **+18.00%** |
+| **1** | 2.1734 | 58.89 | 1.8517 | 69.13 | **+17.38%** |
+| **2** | 2.2099 | 57.92 | 1.8266 | 70.08 | **+20.99%** |
+| **3** | 2.1333 | 60.00 | 1.8647 | 68.64 | **+14.40%** |
+| **4** | 2.1432 | 59.72 | 1.8837 | 67.95 | **+13.78%** |
+| **5** | 2.1302 | 60.09 | 1.8607 | 68.79 | **+14.48%** |
+| **AVERAGE** | **2.1580** | **59.31** | **1.8575** | **68.91** | **+16.18%** |
 
 ---
 

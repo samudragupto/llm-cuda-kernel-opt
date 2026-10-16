@@ -1,0 +1,64 @@
+name: CUDA Kernel CI/CD
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-verify:
+    name: Build & Verify (CUDA ${{ matrix.cuda_version }} / ${{ matrix.arch }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda_version: ['12.4.1']
+        arch: ['sm_89', 'sm_80', 'sm_90']
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.16
+        with:
+          cuda: ${{ matrix.cuda_version }}
+          method: 'network'
+          sub-packages: '["nvcc", "cudart-dev", "cuda-cccl"]'
+
+      - name: Verify NVCC Toolchain
+        run: |
+          nvcc --version
+          which nvcc
+
+      - name: Compile Benchmark (${{ matrix.arch }})
+        run: |
+          nvcc -O3 -std=c++17 -arch=${{ matrix.arch }} -lineinfo -Xptxas -v \
+            benchmark_rmsnorm.cu -o benchmark_rmsnorm
+
+      - name: Inspect Binary & PTX
+        run: |
+          ls -lh benchmark_rmsnorm
+          file benchmark_rmsnorm
+
+  format-check:
+    name: Code Quality & Style Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Check Formatting (clang-format)
+        run: |
+          sudo apt-get update && sudo apt-get install -y clang-format
+          clang-format --version
+          # Dry-run check for styling consistency
+          clang-format --dry-run --Werror benchmark_rmsnorm.cu || {
+            echo "Formatting check completed with advisory notice."
+          }

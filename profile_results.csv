@@ -1,0 +1,10 @@
+Kernel / Variant,Tokens,Time (us),DRAM Throughput (GB/s),% of Peak DRAM Sustained,Speedup vs Baseline
+Baseline (Unfused Naive),1,12.53,,,1.000x
+Vectorized Unfused (Ablation),1,12.90,1.6,,0.971x
+Optimized (Fused Add+RMSNorm),1,6.60,2.5, 1.0%,1.900x
+Baseline (Unfused Naive),256,21.67,,,1.000x
+Vectorized Unfused (Ablation),256,20.56,255.0,,1.054x
+Optimized (Fused Add+RMSNorm),256,17.24,243.2,95.0%,1.257x
+Baseline (Unfused Naive),16384,1406.63,,,1.000x
+Vectorized Unfused (Ablation),16384,1465.79,228.9,,0.960x
+Optimized (Fused Add+RMSNorm),16384,1183.70,226.8,88.6%,1.188x

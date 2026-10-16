@@ -1,0 +1,23 @@
+# Build artifacts
+*.exe
+*.obj
+*.o
+*.lib
+*.exp
+*.ilk
+*.pdb
+
+# Profiler & Temporary outputs
+*.ncu-rep
+ncu_raw.csv
+ncu_stdout.log
+*.log
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# IDE & Editor files
+.vscode/
+.idea/
+.vs/
